@@ -54,6 +54,11 @@ static uint8_t I2CSlaveRecvBufLen;
 static uint8_t I2CSlaveSendBuf[I2C_SND_BUF_SIZE];
 static uint8_t I2CSlaveSendBufLen;
 
+/* EEPROM Emulation at address 0x50 */
+static uint8_t eeprom_data[1024]; // 1KB EEPROM emulation
+static uint16_t eeprom_address = 0; // Current address pointer
+static uint8_t address_bytes_received = 0; // Track address byte reception
+
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -94,15 +99,21 @@ int main(void)
 
   label_counter = dmo_skus[current_sku_index].label_count;
 
-  // Initialize I2C slave emulation
+  // Initialize EEPROM emulation with SLIX2 tag data
   InitEmulationWithCurrentSKU();
-  send_string_to_usb("[I2C] Enabling I2C slave listen mode...\r\n");
+  send_string_to_usb("[EEPROM] SLIX2 tag emulation initialized with authentic data\r\n");
+  char sku_msg[128];
+  snprintf(sku_msg, sizeof(sku_msg), "[EEPROM] Current SKU: %s (%d labels)\r\n",
+           dmo_skus[current_sku_index].sku_name, dmo_skus[current_sku_index].label_count);
+  send_string_to_usb(sku_msg);
+
+  send_string_to_usb("[EEPROM] Enabling I2C EEPROM emulation at address 0x50...\r\n");
   HAL_StatusTypeDef i2c_status = HAL_I2C_EnableListen_IT(&hi2c1);
   if (i2c_status == HAL_OK) {
-    send_string_to_usb("[I2C] I2C slave listen mode enabled successfully\r\n");
+    send_string_to_usb("[EEPROM] I2C EEPROM emulation enabled successfully\r\n");
   } else {
     char status_msg[64];
-    snprintf(status_msg, sizeof(status_msg), "[I2C] Failed to enable I2C listen mode: %d\r\n", i2c_status);
+    snprintf(status_msg, sizeof(status_msg), "[EEPROM] Failed to enable I2C listen mode: %d\r\n", i2c_status);
     send_string_to_usb(status_msg);
   }
   uint8_t message_sent = 0;
@@ -433,23 +444,45 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
   // Debug logging
   char debug_msg[128];
   if (inlength > 0) {
-    snprintf(debug_msg, sizeof(debug_msg), "[CLRC688] RX: cmd=0x%02X len=%d\r\n", pindata[0], inlength);
+    snprintf(debug_msg, sizeof(debug_msg), "[CLRC688] RX: len=%d data=", inlength);
     send_string_to_usb(debug_msg);
+    for (int i = 0; i < inlength && i < 8; i++) {
+      snprintf(debug_msg, sizeof(debug_msg), "0x%02X ", pindata[i]);
+      send_string_to_usb(debug_msg);
+    }
+    send_string_to_usb("\r\n");
   }
 
   *poutlength = 0;
   if( inlength>0 ) {
     switch( pindata[0] ) {
       case 0x00: { //command for reader ic
-        switch( pindata[1] ) {
-          case 0x07: {  //handle xfer to_/from tag
-            EMU_SLIX2_Communication(clrc668_fifo_buffer, clrc668_fifo_length, clrc668_fifo_buffer, &clrc668_fifo_length);
-            EMU_CLRC688_IRQSet(1);   //signal IRQ
-            break;
+        if (inlength >= 2) {
+          char cmd_debug[64];
+          snprintf(cmd_debug, sizeof(cmd_debug), "[CLRC688] CMD: 0x00 0x%02X\r\n", pindata[1]);
+          send_string_to_usb(cmd_debug);
+
+          switch( pindata[1] ) {
+            case 0x07: {  //handle xfer to_/from tag
+              send_string_to_usb("[CLRC688] RF Transfer triggered!\r\n");
+              EMU_SLIX2_Communication(clrc668_fifo_buffer, clrc668_fifo_length, clrc668_fifo_buffer, &clrc668_fifo_length);
+              EMU_CLRC688_IRQSet(1);   //signal IRQ
+              break;
+            }
+            case 0x40: {
+              send_string_to_usb("[CLRC688] Power/config command 0x40\r\n");
+              break;
+            }
+            default: {
+              char default_debug[64];
+              snprintf(default_debug, sizeof(default_debug), "[CLRC688] Unknown 0x00 cmd: 0x%02X\r\n", pindata[1]);
+              send_string_to_usb(default_debug);
+              break;
+            }
           }
+          if( pindata[1] & 0x80 ) //reset the counter when software standby mode is entered
+            EMU_SLIX2_CounterReset();
         }
-        if( pindata[1] & 0x80 ) //reset the counter when software standby mode is entered
-          EMU_SLIX2_CounterReset();
         break;
       }
 
@@ -462,13 +495,73 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
       }
 
       case 0x05: { //fifodata
-        if( inlength>1 ) { //incoming data
+        if( inlength>1 ) { //incoming data - command to tag
           memcpy(clrc668_fifo_buffer, pindata+1, inlength-1);
           clrc668_fifo_length = inlength-1;
+
+          // Process DYMO RFID commands and generate appropriate responses
+          if (clrc668_fifo_length >= 4) {
+            uint8_t cmd = clrc668_fifo_buffer[0];
+            char cmd_debug[128];
+            snprintf(cmd_debug, sizeof(cmd_debug), "[DYMO-RFID] Processing cmd=0x%02X (len=%d): ", cmd, clrc668_fifo_length);
+            send_string_to_usb(cmd_debug);
+            for (int i = 0; i < clrc668_fifo_length && i < 8; i++) {
+              char byte_str[8];
+              snprintf(byte_str, sizeof(byte_str), "0x%02X ", clrc668_fifo_buffer[i]);
+              send_string_to_usb(byte_str);
+            }
+            send_string_to_usb("\r\n");
+
+            switch (cmd) {
+              case 0x36: {
+                // ISO15693 Inventory command - Find DYMO SLIX2 tag
+                send_string_to_usb("[DYMO-RFID] INVENTORY: Printer scanning for authentic DYMO tag\r\n");
+
+                // Response: [response_flags] + [UID] (ISO15693 format)
+                clrc668_fifo_buffer[0] = 0x00; // Response flags (no error)
+                // Copy our authentic SLIX2 UID (from authentic DMO tag data)
+                clrc668_fifo_buffer[1] = 0xBA; clrc668_fifo_buffer[2] = 0x6C;
+                clrc668_fifo_buffer[3] = 0x60; clrc668_fifo_buffer[4] = 0x3D;
+                clrc668_fifo_buffer[5] = 0x08; clrc668_fifo_buffer[6] = 0x01;
+                clrc668_fifo_buffer[7] = 0x04; clrc668_fifo_buffer[8] = 0xE0;
+                clrc668_fifo_length = 9;
+
+                EMU_SLIX2_TAG_PRESENT = true;
+                send_string_to_usb("[DYMO-RFID] RESPONSE: Sending authentic DYMO SLIX2 UID\r\n");
+                break;
+              }
+
+              default: {
+                // Handle other DYMO RFID operations (block reads, counter operations, etc.)
+                snprintf(cmd_debug, sizeof(cmd_debug), "[DYMO-RFID] Unknown/Unhandled command: 0x%02X\r\n", cmd);
+                send_string_to_usb(cmd_debug);
+                // For now, just echo back success
+                clrc668_fifo_buffer[0] = 0x00; // Success response
+                clrc668_fifo_length = 1;
+                break;
+              }
+            }
+
+            // Signal that data is ready
+            EMU_CLRC688_IRQSet(1);
+            char ready_debug[64];
+            snprintf(ready_debug, sizeof(ready_debug), "[DYMO-RFID] Response ready in FIFO (%d bytes)\r\n", clrc668_fifo_length);
+            send_string_to_usb(ready_debug);
+          }
         }
-        else { //outgoing data
-          if( clrc668_fifo_length )
+        else { //outgoing data - read FIFO
+          if( clrc668_fifo_length ) {
             memcpy(poutdata, clrc668_fifo_buffer, clrc668_fifo_length);
+            char fifo_read_debug[128];
+            snprintf(fifo_read_debug, sizeof(fifo_read_debug), "[CLRC688] FIFO READ: sending %d bytes: ", clrc668_fifo_length);
+            send_string_to_usb(fifo_read_debug);
+            for (int i = 0; i < clrc668_fifo_length && i < 8; i++) {
+              char byte_debug[8];
+              snprintf(byte_debug, sizeof(byte_debug), "0x%02X ", poutdata[i]);
+              send_string_to_usb(byte_debug);
+            }
+            send_string_to_usb("\r\n");
+          }
           *poutlength = clrc668_fifo_length;
           clrc668_fifo_length = 0;
         }
@@ -493,8 +586,46 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
         break;
       }
 
-      default: //ignore all other register writes
+      case 0x02: // CLRC688 register
+      case 0x2C: // CLRC688 register
+      case 0x2F: // CLRC688 register
+      case 0x33: // CLRC688 register
+      {
+        if (inlength == 1) {
+          // Register read
+          poutdata[0] = 0x00;
+          *poutlength = 1;
+        } else {
+          // Register write - no response needed
+          *poutlength = 0;
+        }
         break;
+      }
+
+      default: {
+        // Handle other register reads/writes
+        if (inlength == 1) {
+          // Single byte commands - register reads
+          switch (pindata[0]) {
+            case 0x0C: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x2B: poutdata[0] = 0x05; *poutlength = 1; break;
+            case 0x32: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x39: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x0B: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x0F: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x08: poutdata[0] = 0x00; *poutlength = 1; break;
+            case 0x11: poutdata[0] = 0x00; *poutlength = 1; break;
+            default:
+              poutdata[0] = 0x00;
+              *poutlength = 1;
+              break;
+          }
+        } else if (inlength == 2) {
+          // Two byte commands - register writes
+          *poutlength = 0;
+        }
+        break;
+      }
     }
   }
 
@@ -507,52 +638,60 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
       send_string_to_usb(debug_msg);
     }
     send_string_to_usb("\r\n");
+  } else {
+    send_string_to_usb("[CLRC688] TX: no response\r\n");
   }
 }
 
 void InitEmulationWithCurrentSKU(void) {
-  // Initialize with default SLIX2 data for the current SKU
-  // These are based on the FreeDMO repository default values
+  // Initialize EEPROM data with authentic SLIX2 tag layout
+  // Clear EEPROM first
+  memset(eeprom_data, 0, sizeof(eeprom_data));
 
-  // Default inventory data (UID pattern)
-  const uint8_t default_inventory[SLIX2_INVENTORY_LEN] = {0x01,0xBA,0x6C,0x60,0x3D,0x08,0x01,0x04,0xE0};
-  memcpy(EMU_SLIX2_INVENTORY, default_inventory, SLIX2_INVENTORY_LEN);
+  // Use authentic SLIX2 tag data from FreeDMO repository
+  // Based on DMO_SKU_30252 working data
 
-  // Default system info
-  const uint8_t default_sysinfo[SLIX2_SYSINFO_LEN] = {0x0F,0xBA,0x6C,0x60,0x3D,0x08,0x01,0x04,0xE0,0x01,0x3D,0x4F,0x03,0x01};
-  memcpy(EMU_SLIX2_SYSINFO, default_sysinfo, SLIX2_SYSINFO_LEN);
-
-  // Default NXP system info
-  const uint8_t default_nxpsysinfo[SLIX2_NXPSYSINFO_LEN] = {0x32,0x02,0x0F,0x7F,0x35,0x00,0x00};
-  memcpy(EMU_SLIX2_NXPSYSINFO, default_nxpsysinfo, SLIX2_NXPSYSINFO_LEN);
-
-  // Default signature
-  const uint8_t default_signature[SLIX2_SIGNATURE_LEN] = {
-    0x33,0x4A,0x63,0x63,0xD0,0x13,0x49,0xDB,0xA0,0x9E,0xEE,0x15,0x1E,0xF8,0xF8,0xF3,
-    0xFA,0x15,0xF5,0x77,0xE4,0x4D,0x75,0x9B,0x78,0x14,0xCA,0xD3,0x7E,0x02,0xEF,0x10
+  // SLIX2 tag blocks data (80 blocks of 4 bytes each = 320 bytes starting at address 0x00)
+  const uint32_t authentic_blocks[SLIX2_BLOCKS] = {
+    0xed820a03, 0xd2613986, 0x321e1403, 0x3c00cab6, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x015e0000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00010000
   };
-  memcpy(EMU_SLIX2_SIGNATURE, default_signature, SLIX2_SIGNATURE_LEN);
 
-  // Default blocks data with current SKU label count
-  memset(EMU_SLIX2_BLOCKS, 0, SLIX2_BLOCKS*sizeof(uint32_t));
+  // Copy blocks data to EEPROM (little-endian format)
+  for (int i = 0; i < SLIX2_BLOCKS; i++) {
+    uint32_t block = authentic_blocks[i];
+    eeprom_data[i*4 + 0] = (block >> 0) & 0xFF;
+    eeprom_data[i*4 + 1] = (block >> 8) & 0xFF;
+    eeprom_data[i*4 + 2] = (block >> 16) & 0xFF;
+    eeprom_data[i*4 + 3] = (block >> 24) & 0xFF;
+  }
 
-  // DMO header and magic bytes
-  EMU_SLIX2_BLOCKS[0] = 0xed820a03;
-  EMU_SLIX2_BLOCKS[1] = 0xd2613986;
-  EMU_SLIX2_BLOCKS[2] = 0x321e1403;
-  EMU_SLIX2_BLOCKS[3] = 0x3c00cab6;
-
-  // Set label count from current SKU
+  // Adjust label count for current SKU at block 0x0F (offset 0x3C in EEPROM)
   const dmo_sku_t* current_sku = &dmo_skus[current_sku_index];
-  EMU_SLIX2_BLOCKS[0x0F] = (uint32_t)current_sku->label_count << 16;
-  EMU_SLIX2_BLOCKS[0x10] = 0x00000000; // Counter margin
+  uint32_t label_count_block = (uint32_t)current_sku->label_count << 16;
+  eeprom_data[0x3C] = (label_count_block >> 0) & 0xFF;
+  eeprom_data[0x3D] = (label_count_block >> 8) & 0xFF;
+  eeprom_data[0x3E] = (label_count_block >> 16) & 0xFF;
+  eeprom_data[0x3F] = (label_count_block >> 24) & 0xFF;
 
-  // Counter value (last block)
-  EMU_SLIX2_BLOCKS[79] = 0x00010000; // Initial counter value
+  // Reset EEPROM address pointer
+  eeprom_address = 0;
+  address_bytes_received = 0;
 
-  // Reset counter
-  EMU_SLIX2_CounterReset();
-  EMU_SLIX2_TAG_PRESENT = false;
+  // Debug: Show first few bytes of EEPROM data
+  char eeprom_debug[128];
+  snprintf(eeprom_debug, sizeof(eeprom_debug), "[EEPROM] First 16 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+           eeprom_data[0], eeprom_data[1], eeprom_data[2], eeprom_data[3], eeprom_data[4], eeprom_data[5], eeprom_data[6], eeprom_data[7],
+           eeprom_data[8], eeprom_data[9], eeprom_data[10], eeprom_data[11], eeprom_data[12], eeprom_data[13], eeprom_data[14], eeprom_data[15]);
+  send_string_to_usb(eeprom_debug);
 }
 
 void UpdateEmulationDataForSKUChange(void) {
@@ -561,37 +700,49 @@ void UpdateEmulationDataForSKUChange(void) {
   InitEmulationWithCurrentSKU();
 }
 
-/* I2C Slave Callback Functions */
+/* I2C Slave Callback Functions - DYMO RFID Emulation */
+static uint32_t transaction_counter = 0;
+
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t transferDirection, uint16_t addrMatchCode) {
-  // Debug logging
+  transaction_counter++;
+
+  send_string_to_usb("\r\n=== TX START ===\r\n");
   char debug_msg[64];
-  snprintf(debug_msg, sizeof(debug_msg), "[I2C] Addr callback: dir=%d, addr=0x%X\r\n", transferDirection, addrMatchCode);
+  snprintf(debug_msg, sizeof(debug_msg), "[TX#%lu] dir=%d\r\n", transaction_counter, transferDirection);
   send_string_to_usb(debug_msg);
 
   if (transferDirection == I2C_DIRECTION_RECEIVE) {
-    // Master wants to receive data from us (read operation)
-    EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
-    snprintf(debug_msg, sizeof(debug_msg), "[I2C] Sending %d bytes\r\n", I2CSlaveSendBufLen);
+    // Master wants to read from us - process previous command and send response
+    snprintf(debug_msg, sizeof(debug_msg), "[I2C] READ - Processing %d received bytes\r\n", I2CSlaveRecvBufLen);
     send_string_to_usb(debug_msg);
+
+    // Use CLRC688 communication to generate response
+    EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
+
+    snprintf(debug_msg, sizeof(debug_msg), "[I2C] SENDING %d bytes\r\n", I2CSlaveSendBufLen);
+    send_string_to_usb(debug_msg);
+
     HAL_I2C_Slave_Seq_Transmit_IT(hi2c, I2CSlaveSendBuf, I2CSlaveSendBufLen, I2C_LAST_FRAME);
   } else {
-    // Master wants to send data to us (write operation)
+    // Master wants to write to us - receive command/data
     I2CSlaveRecvBufLen = 0;
-    send_string_to_usb("[I2C] Starting receive\r\n");
+    send_string_to_usb("[I2C] WRITE - Receiving command\r\n");
     HAL_I2C_Slave_Seq_Receive_IT(hi2c, I2CSlaveRecvBuf, 1, I2C_NEXT_FRAME);
   }
-  // Note: LED control requires GPIO configuration - placeholder for now
-  // HAL_GPIO_WritePin(OUT_LED_GPIO_Port, OUT_LED_Pin, GPIO_PIN_RESET);
 }
 
 void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
-  I2CSlaveRecvBufLen++;
   char debug_msg[64];
-  snprintf(debug_msg, sizeof(debug_msg), "[I2C] Received byte: 0x%02X (len=%d)\r\n", I2CSlaveRecvBuf[I2CSlaveRecvBufLen-1], I2CSlaveRecvBufLen);
+  uint8_t received_byte = I2CSlaveRecvBuf[I2CSlaveRecvBufLen];
+  I2CSlaveRecvBufLen++;
+
+  snprintf(debug_msg, sizeof(debug_msg), "[I2C] RX: 0x%02X (len=%d)\r\n", received_byte, I2CSlaveRecvBufLen);
   send_string_to_usb(debug_msg);
 
-  if( I2CSlaveRecvBufLen < I2C_RCV_BUF_SIZE )
+  // Continue receiving if buffer not full
+  if (I2CSlaveRecvBufLen < I2C_RCV_BUF_SIZE) {
     HAL_I2C_Slave_Seq_Receive_IT(hi2c, I2CSlaveRecvBuf + I2CSlaveRecvBufLen, 1, I2C_NEXT_FRAME);
+  }
 }
 
 void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c) {
@@ -603,17 +754,26 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
   snprintf(debug_msg, sizeof(debug_msg), "[I2C] Listen complete, received %d bytes\r\n", I2CSlaveRecvBufLen);
   send_string_to_usb(debug_msg);
 
+  // Process command with CLRC688 emulation for DYMO RFID operations
   EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
+
+  send_string_to_usb("=== TX END ===\r\n");
+
+  // Re-enable listening for next transaction
   HAL_I2C_EnableListen_IT(hi2c);
-  // Note: LED control requires GPIO configuration - placeholder for now
-  // HAL_GPIO_WritePin(OUT_LED_GPIO_Port, OUT_LED_Pin, GPIO_PIN_SET);
 }
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
   char debug_msg[64];
-  snprintf(debug_msg, sizeof(debug_msg), "[I2C] Error callback: state=0x%08X, error=0x%08X\r\n",
+  snprintf(debug_msg, sizeof(debug_msg), "[I2C] Error: state=0x%08X, error=0x%08X\r\n",
            (unsigned int)hi2c->State, (unsigned int)hi2c->ErrorCode);
   send_string_to_usb(debug_msg);
+
+  // Check if this is just an AF (Acknowledge Failure) which is normal at end of read
+  if (hi2c->ErrorCode == HAL_I2C_ERROR_AF) {
+    send_string_to_usb("[I2C] AF error - normal end of transaction\r\n");
+  }
+
   HAL_I2C_EnableListen_IT(hi2c);
 }
 
